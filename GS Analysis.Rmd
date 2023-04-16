@@ -1,0 +1,844 @@
+---
+title: "Final_Project"
+output: html_document
+date: "2023-03-22"
+---
+
+Data extraction process:
+This was done using an API call using One Map API, to extract geographic coordinates based on addresses in the school dataset, with an output shapefile. The code for this can be found in the attached ipynb.
+
+First, we load the libraries and read in the shapefile.
+```{r,results='hide'}
+library(sf);library(spatstat);library(tmap);library(aspace, quietly = T);library(dplyr);library(tidyr);library(stats)
+```
+
+```{r}
+df <- st_read("/Users/celyntay/downloads/dsa303/data/SchoolData.shp")
+class(df)
+summary(df)
+st_is_longlat(df) #NA
+st_crs(df)
+df = st_set_crs(df, 4326)
+st_is_longlat(df)
+st_crs(df)$proj4string
+
+df %>%
+  filter(is.na(Latitude)==TRUE)
+```
+
+To make sure we don't have schools with empty coordinates:
+```{r}
+table(is.na(df$Latitude))
+table(is.na(df$Longitude))
+```
+All 346 schools have coordinates.
+
+Now we will read in the Singapore Planning Area, and transform our dataframe to the same projected CRS as the Singapore Planning Area file.
+```{r}
+sg <- st_read("/Users/celyntay/downloads/dsa303/data/MP14_PLNG_AREA_NO_SEA_PL.shp")
+st_crs(sg)$proj4string
+table(st_is_valid(sg))
+sg = st_make_valid(sg)
+table(st_is_valid(sg))
+
+df.proj = st_transform(df, crs = st_crs(sg))
+st_crs(df.proj)$proj4string
+isTRUE(all.equal(st_crs(sg),st_crs(df.proj)))
+class(df.proj)
+summary(df.proj)
+table(st_is_valid(df.proj))
+table(is.na(df.proj$Latitude))
+table(is.na(df.proj$Longitude))
+```
+
+Plot a simple map to visualise the location of all schools in Singapore. The number of schools is too long to display in the plot and thus analyse, but this gives us a broad idea of how schools are distributed in Singapore.
+```{r}
+tm_shape(sg)+
+  tm_borders()+
+  tm_shape(df.proj)+
+  tm_dots()+
+  tmap_options(max.categories=346)+
+  tm_layout(main.title = "Distribution of Schools in Singapore")+
+  tm_compass(type = "4star",position=c("left","top")) + 
+  tm_scale_bar(position = c("right","top"))
+```
+
+Noticeably, there's a planning area within the standard distance that does not have any schools - this is the central water catchment, hence explaining why there might be a lack of schools, as it is a vast, and beautiful, network of reservoirs and forests in the geographical heart of Singapore without much built up area for a school. Unless, of course, we have a nature-based school.
+
+It is also interesting to note that the location of schools coincides with residential areas. This is a map detailing the land use types in Singapore, where beige represents residential areas. A comparision between the images will reveal that the location of schools mostly coincide with residential areas. 
+
+!["Detailed Planning Area Map, with colour codes for land use type."](/Users/celyntay/downloads/dsa303/data/URA-legend.webp)
+
+
+We will now create a ppp object and plot it. There are no duplicated points so we don't need to perturb the coordinates. There also shouldn't be any duplicated points, as schools cannot have overlapping coordinates, unless it was a school that was demolished and rebuilt into another one at the same site. However, our data is the most updated version, and hence any developmental changes would be reflected, and the old school's name and coordinates will be updated with the new school's ones.
+```{r}
+df.ppp = as.ppp(df.proj)
+# create the window 
+sg_outline = st_union(sg) # sg outline
+(sg.owin = as.owin(sg_outline))
+class(sg.owin) #owin
+Window(df.ppp) = sg.owin
+df.ppp # still 346 points.
+plot(df.ppp, pch=20, size=0.5, main = "Schools in Singapore")
+
+table(duplicated(df.ppp))
+```
+The displayed school names are a subset of all school names.
+
+# First Order Analysis
+
+### Quadrant Count Analysis
+We will do a first order analysis, starting with quadrant count analysis.
+```{r}
+qc = quadratcount(df.ppp,nx=10,ny=10)
+class(qc)
+plot(qc, main = "Quadrat counts for Schools in Singapore (10x10)")
+```
+
+```{r}
+qc.df <- data.frame(qc)
+qc.freqtable <- qc.df %>% count(Freq, sort = TRUE)
+qc.freqtable %>%
+  mutate(Prob = n/sum(n), EX = sum(Freq*Prob), VarX = sum(Freq^2*Prob) - (sum(Freq*Prob))^2)
+```
+
+* Expected value is 4.613333
+* Variance is 47.81049
+Based on this, as expected value and variance are not equal, we can tell the distribution might not be a poisson distribution.
+
+```{r}
+quad.test = quadrat.test(df.ppp, nx=10,ny=10)
+quad.test
+```
+p-value < 2.2e-16 < 0.05
+At the 0.05 level of significance, there is sufficient evidence to reject the null hypothesis that the data has a Poisson distribution. 
+
+```{r}
+quad.test$observed
+quad.test$parameter
+n = quad.test$parameter + 1
+n
+lambda = sum(quad.test$observed)/n
+lambda
+```
+Lambda = 4.613333 
+
+If the point pattern were to follow a homogenous poisson process and thus have complete spatial randomness, then the quadrat counts should have a frequency distribution as depicted below:
+```{r}
+plot(dpois(0:30, lambda=4.613333),type="l",xlab="Quadrat count", ylab="Probability",main="Theoretical Distribution for Po(4.613333)")
+```
+
+A plot to compare the expected v.s. observed frequencies from our quadrant count analysis.
+```{r}
+observed = table(quad.test$observed)
+max.num = max(quad.test$observed) # maximum number of observations in a single quadrat
+max.freq = max(observed) # maximum frequency
+plot(c(0,max.num),c(0,max.freq), 
+     type="n", 
+     xlab="Number of schools per Subquadrat", 
+     ylab="Frequency of Occurences", 
+     main="Quadrat counts: Observed vs Expected")
+legend(20,40, legend =c("Observed","Expected"), col = c("red","blue"), lty = 1:1)
+points(dpois(0:max.num, lambda=lambda)*n, 
+       type="l", 
+       col="Blue", 
+       lwd=2)
+points(observed, col="Red", type="l", lwd=2)
+```
+
+Clearly, the point pattern does not follow a HPP.
+
+Given the MAUP, we experimented with different sizes of the grid cells.
+```{r}
+quad.test15 = quadrat.test(df.ppp, nx=15,ny=15)
+quad.test15
+quad.test15$observed
+quad.test15$parameter
+n15 = quad.test15$parameter + 1
+n15
+lambda15 = sum(quad.test15$observed)/n15
+lambda15
+observed15 = table(quad.test15$observed)
+max.num15 = max(quad.test15$observed) # maximum number of observations in a single quadrat
+max.freq15 = max(observed15) # maximum frequency
+plot(c(0,max.num15),c(0,max.freq15), 
+     type="n", 
+     xlab="For 15x15 grid: Number of schools per Subquadrat", 
+     ylab="Frequency of Occurrences", 
+     main="Quadrat counts: Observed vs Expected")
+legend(12,90, legend =c("Observed","Expected"), col = c("red","blue"), lty = 1:1)
+points(dpois(0:max.num15, lambda=lambda15)*n15, 
+       type="l", 
+       col="Blue", 
+       lwd=2)
+points(observed15, col="Red", type="l", lwd=2)
+qc15 = quadratcount(df.ppp,nx=15,ny=15)
+plot(qc15, main = "Quadrat counts for Schools in Singapore (15x15)")
+```
+
+It still does not follow a HPP when we changed the grid size to 15x15. There is sufficient evidence to reject H0 that it is a Poisson distribution at 0.05 level of significance.
+
+We tried to change to a 5x5 grid.
+```{r}
+quad.test5 = quadrat.test(df.ppp, nx=5,ny=5)
+quad.test5
+quad.test5$observed
+quad.test5$parameter
+n5 = quad.test5$parameter + 1
+n5
+lambda5 = sum(quad.test5$observed)/n5
+lambda5
+observed5 = table(quad.test5$observed)
+max.num5 = max(quad.test5$observed) # maximum number of observations in a single quadrat
+max.freq5 = max(observed5) # maximum frequency
+plot(c(0,max.num5),c(0,max.freq5), 
+     type="n", 
+     xlab="For 5x5 grid: Number of schools per Subquadrat", 
+     ylab="Frequency of Occurrences", 
+     main="Quadrat counts: Observed vs Expected")
+legend(45,8, legend =c("Observed","Expected"), col = c("red","blue"), lty = 1:1)
+points(dpois(0:max.num5, lambda=lambda5)*n5, 
+       type="l", 
+       col="Blue", 
+       lwd=2)
+points(observed5, col="Red", type="l", lwd=2)
+qc5 = quadratcount(df.ppp,nx=5,ny=5)
+plot(qc5, main = "Quadrat counts for Schools in Singapore (5x5)")
+```
+
+It does not follow a HPP either. There is sufficient evidence to reject H0 that it is a Poisson distribution at 0.05 level of significance.
+
+We can conclude that our observed point pattern does not follow a homogenous poisson process and thus does not exhibit complete spatial randomness.
+
+### Kernel Density Estimation
+
+We moved to Kernel Density Estimation, the second method under first order analysis. 
+
+We first tried out different kernels, using bw.diggle, a cross validated bandwidth selection method, to select the bandwidth.
+```{r}
+par(mfrow = c(2,2))
+plot(density(df.ppp, 
+             kernel="gaussian",
+             sigma=bw.diggle(df.ppp)),
+     main = " Gaussian Kernel Density (bw.diggle)")
+plot(density(df.ppp, 
+             kernel="epanechnikov",
+             sigma=bw.diggle(df.ppp)),
+     main = "Epanechnikov Kernel Density (bw.diggle)")
+plot(density(df.ppp, 
+             kernel="quartic",
+             sigma=bw.diggle(df.ppp)),
+     main = "Quartic Kernel Density (bw.diggle)")
+plot(density(df.ppp, 
+             kernel="disc",
+             sigma=bw.diggle(df.ppp)),
+     main = "Disc Kernel Density (bw.diggle)")
+```
+
+Another bandwidth selection method that was attempted was bw.ppl
+```{r}
+par(mfrow = c(2,2))
+plot(density(df.ppp, 
+             kernel="gaussian",
+             sigma=bw.ppl(df.ppp)),
+     main = "Gaussian Kernel Density (bw.ppl)")
+plot(density(df.ppp, 
+             kernel="epanechnikov",
+             sigma=bw.ppl(df.ppp)),
+     main = "Epanechnikov Kernel Density (bw.ppl)")
+plot(density(df.ppp, 
+             kernel="quartic",
+             sigma=bw.ppl(df.ppp)),
+     main = "Quartic Kernel Density (bw.ppl)")
+plot(density(df.ppp, 
+             kernel="disc",
+             sigma=bw.ppl(df.ppp)),
+     main = " Disc Kernel Density (bw.ppl)")
+```
+
+At this point, we felt that the gaussian kernel had given us the clearest visual image of the density of schools, hence we chose to plot only that kernel. We felt the bandwidth made more of a difference than kernels as well. We will now explore with bw.CvL
+```{r}
+plot(density(df.ppp, 
+             kernel="gaussian",
+             sigma=bw.CvL(df.ppp)),
+     main = "Gaussian Kernel Density (bw.CvL)")
+```
+
+We saw that bw.CvL was not a good way to accurately plot the densities of schools, but it gave us an idea that most schools were clustered towards the eastern part of Singapore. 
+
+This is because bw.CvL selects bandwidth by minimising the discrepancy between the area of the observation window and the sum of reciprocal estimated intensity values at the points of the process, where the sum is taken over all the data points.
+As a result, the bandwidth value is huge, which leads to oversmoothing, as seen in the following values of sigma for bw.diggle, bw.ppl, and bw.CvL respectively.
+
+```{r}
+bw.diggle(df.ppp)
+bw.ppl(df.ppp)
+bw.CvL(df.ppp)
+```
+
+We experimented with other kernel bandwidth selection methods.
+```{r}
+plot(density(df.ppp, 
+             kernel="gaussian",
+             sigma=bw.scott(df.ppp)),
+     main = "Gaussian Kernel Density Plot: Scott Method")
+```
+
+The Scott bandwidth method is typically used for normal symmetric and unimodal data, hence as our data is multi-modal, as seen from the other density plots, it is an inappropriate bandwidth selection method.
+
+In scouring different bandwidth selection methods that were appropriate for our data, we found that unbiased cross validation and sheather and jones were 2 popular methods for presenting multimodality.
+
+We have experimented with Sheather and Jones method below:
+```{r}
+coords <- c(c(df.ppp)$x, c(df.ppp)$y)
+plot(density(df.ppp, kernel = "gaussian", sigma=bw.SJ(coords)),
+     main = "Gaussian Kernel Density Plot: Sheather & Jones Method")
+```
+
+We have experimented with unbiased cross validation method below:
+
+```{r}
+plot(density(df.ppp, kernel="gaussian",sigma=bw.ucv(coords)),
+     main = "Gaussian Kernel Density Plot: Unbiased Cross Validation Method")
+```
+
+Through our research, we have found that unbiased cross validation overfits the data, as the sample size increases, in comparison to the Sheather and Jones method, which provides a much smoother plot. (Varet et al., 2019)
+
+```{r}
+par(mfrow=c(1,2))
+plot(density(df.ppp, kernel = "gaussian", sigma=stats::bw.SJ(coords)),
+     main="Sheather & Jones Method")
+plot(density(df.ppp, 
+             kernel="gaussian",
+             sigma=bw.diggle(df.ppp)),
+     main="Diggle Method")
+```
+
+We preferred the Sheather and Jones method the most because we were looking for a more gradual trend in desnity, while the Diggle method revealed more granularity in the density.
+
+Based on the term that we've derived from our nearest neighbour analysis following this, we used that value to plot the bandwidth. It looks similar to the diggle and Sheather and Jones method.
+```{r}
+plot(density(df.ppp,kernel = "gaussian", sigma=1084.903), main = "Kernel Density Plot with bandwidth = 1084.903")
+```
+
+#### Conclusions:
+Schools have clusters in most parts of Singapore, where there are more clusters with higher number of schools in each cluster towards the Eastern region of Singapore. 
+
+# Analysis of Marks
+
+Since we had other types of marks available in our dataset, we decided to extend our analysis. This is the analysis for the nature of schools, which are split into boys, coed, and girls.
+```{r}
+df.proj$nature_cod <- as.factor(df.proj$nature_cod)
+xy <- st_coordinates(df.proj)
+df.ppp.test <- ppp(xy[,1], xy[,2], marks = df.proj$nature_cod,
+                   window = sg.owin)
+df.ppp.test <- unique.ppp(df.ppp.test)
+
+spp <- split(df.ppp.test)
+plot(spp[1], main="Nature of School: Boys' School")
+plot(spp[2], main="Nature of School: Co-ed' School")
+plot(spp[3], main="Nature of School: Girls' School")
+```
+
+We wanted to plot the density of these schools by their nature.
+```{r}
+plot(density(spp[1],kernel="gaussian",
+             sigma=bw.diggle(df.ppp.test)), main="Gaussian Kernel Density using Diggle")
+plot(density(spp[2],kernel="gaussian",
+             sigma=bw.diggle(df.ppp.test)), main="Gaussian Kernel Density Plot using Diggle")
+plot(density(spp[3],kernel="gaussian",
+             sigma=bw.diggle(df.ppp.test)), main="Gaussian Kernel Density Plot using Diggle")
+```
+
+#### Conclusions:
+Boys' schools can be mostly found towards the Eastern region of Singapore, while Girls' schools can be found in central and eastern regions. Co-ed schools show similar density as the general schools density. They do not seem to follow a HPP.
+
+We would like to do a first order point pattern analysis using quadrat count on the boys schools.
+```{r}
+quad.test.boys = quadrat.test(spp[1], nx=5,ny=5)
+quad.test.boys
+```
+```{r}
+quad.test.boys$parameter
+n.boy = quad.test.boys$parameter + 1
+n.boy
+lambda.boy = sum(quad.test.boys$observed)/n.boy
+lambda.boy
+observed.boy = table(quad.test.boys$observed)
+max.num.boy = max(quad.test.boys$observed) # maximum number of observations in a single quadrat
+max.freq.boy = max(observed.boy) # maximum frequency
+plot(c(0,max.num.boy),c(0,max.freq.boy), 
+     type="n", 
+     xlab="For 5x5 grid: Number of boys schools per Subquadrat", 
+     ylab="Frequency of Occurrences", 
+     main="Quadrat counts: Observed vs Expected")
+legend(5,15, legend =c("Observed","Expected"), col = c("red","blue"), lty = 1:1)
+points(dpois(0:max.num.boy, lambda=lambda.boy)*n.boy, 
+       type="l", 
+       col="Blue", 
+       lwd=2)
+points(observed.boy, col="Red", type="l", lwd=2)
+qc.boy = quadratcount(spp[1],nx=5,ny=5)
+plot(qc.boy, main = "Quadrat counts for Boys' School (5x5)")
+```
+
+There aren't enough boys schools to do a first order analysis using quadrat count to determine if the boys schools follow a HPP.
+
+#### To conclude our first order analysis, we found that schools in Singapore do not follow a HPP and thus do not have complete spatial randomness.
+
+# Second Order Analysis
+
+## Clark & Evans Aggregation Index, Clarke and Evans Test
+We will now do a second order analysis. The first method is the Clark & Evans Aggregation Index and Clarke & Evans Test. 
+
+If the schools in Singapore follow a HPP, observed distance would be equal to the expected distance and R=1. Thus, if R<1, it would denote that the observed distance is less than the expected distance, indicating that clustering is occurring. On the other hand, if R>1, it would denote that the observed distance is more than the expected distance, indicating that dispersion is occurring. Donelly edge correction was not applied as it the region is not rectangular. A guard region was also not applied as that would indicate we are looking at areas outside Singapore, where Singapore schools do not exist.
+```{r}
+clarkevans(df.ppp, correction="none") 
+clarkevans.test(df.ppp, correction="none", alternative="less")
+```
+
+The value of 0.4861304 indicates that nearest neighbours, are on the average, 0.486 times as far apart as expected under the conditions of CSR.
+
+In this case, the Clarke & Evans Test indicates that R<1 and p-value < 2.2e-16 < 0.05
+At the 0.05 level of significance, there is sufficient evidence to reject the null hypothesis that Clark & Evans Aggregation Index is 1, and hence the point pattern does not follow a homogenous poisson process. Instead, there is significant clustering. 
+
+
+### Clark & Evan's Test, by school levels
+```{r}
+pri = subset(df.proj, mainlevel_ == "PRIMARY")
+sec = subset(df.proj, mainlevel_ == "SECONDARY")
+jc = subset(df.proj, mainlevel_ == "JUNIOR COLLEGE")
+
+pri.ppp = as.ppp(pri)
+sec.ppp = as.ppp(sec)
+jc.ppp = as.ppp(jc)
+
+Window(pri.ppp) = sg.owin
+Window(sec.ppp) = sg.owin
+Window(jc.ppp) = sg.owin
+
+plot(pri.ppp, pch=20, size=0.5, main = "Primary Schools in Singapore")
+plot(sec.ppp, pch=20, size=0.5, main = "Secondary Schools in Singapore")
+plot(jc.ppp, pch=20, size=0.5, main = "Junior Colleges in Singapore")
+
+table(duplicated(pri.ppp))
+table(duplicated(sec.ppp))
+table(duplicated(jc.ppp))
+```
+
+
+Primary School C&E test results:
+```{r}
+clarkevans(pri.ppp, correction="none") 
+clarkevans.test(pri.ppp, correction="none")
+```
+
+
+R = 0.63082, p-value < 2.2e-16, hence there is sufficient evidence at the 0.05 level of significance to reject the null hypothesis of R = 0, hence primary schools do not follow HPP. As R < 1, there is clustering of primary schools, but less clustered than all schools in Singapore (R value = 0.4861304).
+
+Secondary school results:
+```{r}
+clarkevans(sec.ppp, correction="none") 
+clarkevans.test(sec.ppp, correction="none")
+```
+
+
+R = 0.63911, p-value = 4.441e-16, hence there is sufficient evidence at the 0.05 level of significance to reject the null hypothesis of R = 0, hence secondary schools do not follow HPP. As R < 1, there is clustering of secondary schools, but less clustered than all schools in Singapore (R value = 0.4861304), and less clustered than primary schools (R = 0.63082).
+
+Junior College results:
+```{r}
+clarkevans(jc.ppp, correction="none") 
+clarkevans.test(jc.ppp, correction="none", alternative = "greater")
+```
+
+
+Based on the plot of junior colleges, we might have reason to believe that R > 1 as they look quite disperesed.
+
+R = 1.0564, p-value = 0.3666, there is insufficient evidence at the 0.05 level of significant to reject the null hypothesis that R = 0. 
+Since R > 1, the observed distances between junior colleges are larger than the expected distances, hence there could be slight dispersion.
+
+
+## Nearest Neighbour Distance Analysis on all schools
+Next, we conduct a nearest neighbour distance analysis.
+```{r}
+df.nnd1 = nndist(df.ppp, k=1)
+summary(df.nnd1)
+df.nnd2 = nndist(df.ppp, k=2)
+df.nnd3 = nndist(df.ppp, k=3)
+df.nnd4 = nndist(df.ppp, k=4)
+df.nnd5 = nndist(df.ppp, k=5)
+par(mfrow = c(2,3))
+hist(df.nnd1)
+hist(df.nnd2)
+hist(df.nnd3)
+hist(df.nnd4)
+hist(df.nnd5)
+
+mean(df.nnd1)
+mean(df.nnd5)
+```
+
+At k=1, we note that the points are quite clustered with many points lying within close distance to one another, and that the average nearest neighbour distance is 365.4036m, which is the average distance to the nearest school. As k increases, the average nearest neighbour distance also increases, at 1084.903m for k=5, which is the average distance from a school to the nearest 5 schools.
+
+To confirm the whether there is clustering, we can also do this manually.
+```{r}
+class(df.nnd1)
+df.nnd1 = as.matrix(df.nnd1)
+r.bar = sum(df.nnd1)/nrow(df.nnd1)
+Er = 0.5*sqrt(area.owin(sg.owin)/nrow(df.nnd1))
+CE.index = r.bar/Er
+Zstat = ((r.bar-Er)/ 0.26136)*sqrt(nrow(df.nnd1)^2/area.owin(sg.owin))
+Zstat
+```
+The z-stat is -18.28613 and thus p-value < 0.05 
+At the 0.05 level of significance, there is sufficient evidence to reject the null hypothesis that the data follows a HPP and that there is significant clustering.
+
+
+
+## K-function Analysis on all schools
+
+Another method is the K-function analysis.
+```{r}
+df.kf = Kest(df.ppp, correction="none")
+plot(df.kf, main="K-function")
+
+par(mfrow = c(1,3))
+df.kfenv = envelope(df.ppp, Kest, correction="none")
+plot(df.kfenv, 
+     main = "K-function")
+df.lfenv = envelope(df.ppp, Lest, correction="none") 
+plot(df.lfenv, 
+     main = "L-function")
+df.gfenv = envelope(df.ppp, Gest, correction="none") 
+plot(df.gfenv, 
+     main = "G-function")
+```
+
+The observed K-function, L-function and G-function is higher than the envelope of simulated functions for CSR, suggesting strong evidence of clustering.
+
+### K-function Analysis, by school levels
+
+Primary School results:
+```{r}
+pri.kf = Kest(pri.ppp, correction="border")
+plot(pri.kf, main="K-function (Primary School)")
+
+par(mfrow = c(1,3))
+pri.kfenv = envelope(pri.ppp, Kest, correction="none")
+plot(pri.kfenv, 
+     main = "K-function (Primary School)")
+pri.lfenv = envelope(pri.ppp, Lest, correction="none") 
+plot(pri.lfenv, 
+     main = "L-function (Primary School)")
+pri.gfenv = envelope(pri.ppp, Gest, correction="none") 
+plot(pri.gfenv, 
+     main = "G-function (Primary School)")
+```
+
+The observed K-function, L-function and G-function is higher than the envelope of simulated functions for CSR, suggesting clustering amongst primary schools.
+
+Secondary school results:
+```{r}
+sec.kf = Kest(sec.ppp, correction="none")
+plot(sec.kf, main="K-function (Secondary School)")
+
+par(mfrow = c(1,3))
+sec.kfenv = envelope(sec.ppp, Kest, correction="none")
+plot(sec.kfenv, 
+     main = "K-function (Secondary School)")
+sec.lfenv = envelope(sec.ppp, Lest, correction="none") 
+plot(sec.lfenv, 
+     main = "L-function (Secondary School)")
+sec.gfenv = envelope(sec.ppp, Gest, correction="none") 
+plot(sec.gfenv, 
+     main = "G-function (Secondary School)")
+```
+
+The observed K-function, L-function and G-function is higher than the envelope of simulated functions for CSR, suggesting clustering amongst secondary schools.
+
+Junior college results:
+```{r}
+jc.kf = Kest(jc.ppp, correction="none")
+plot(jc.kf, main="K-function (Junior College)")
+
+par(mfrow = c(1,3))
+jc.kfenv = envelope(jc.ppp, Kest, correction="none")
+plot(jc.kfenv, 
+     main = "K-function (Junior College)")
+jc.lfenv = envelope(jc.ppp, Lest, correction="none") 
+plot(jc.lfenv, 
+     main = "L-function (Junior College)")
+jc.gfenv = envelope(jc.ppp, Gest, correction="none") 
+plot(jc.gfenv, 
+     main = "G-function (Junior College)")
+```
+
+The observed K-function, L-function and G-function is lower than the envelope of simulated functions for CSR when r < 2000, indicating dispersion. When r increases, the observed K-function and L-function higher than the envelope of simulated functions for CSR, suggesting clustering amongst junior colleges. However, the observed G-function is lower than the envelope of simulated functions for CSR when r > 5000, indicating dispersion.
+
+#### In conclusion, from the second order analysis, schools in Singapore at a total level, do not follow HPP and do not have CSR. Rather, there is strong indication that clustering occurs.
+
+# Spatial Measures
+
+We also plotted the different spatial measures.
+
+```{r}
+df.loc = tm_shape(sg)+tm_borders()+tm_shape(df.proj)+tm_dots(col="black")
+coords = st_coordinates(df)
+calc_sde(id=1, filename = "df_sde.txt", calccentre = T, weighted = F, points=coords)
+sde = sdeloc %>% st_as_sf(coords = c("x", "y"), crs=4326) %>% st_combine() %>% 
+    st_cast("LINESTRING")
+sde = st_sf(sdeatt, geom=st_geometry(sde))
+calc_sdd(id=1, filename = "df_sdd.txt", calccentre = T, weighted = F, points=coords)
+sdd = sddloc %>% st_as_sf(coords = c("x", "y"), crs=4326) %>% st_combine() %>% 
+    st_cast("LINESTRING")
+sdd = st_sf(sddatt, geom=st_geometry(sdd))
+mean = sdeatt[, 4:5]
+mean = st_as_sf(mean, coords = c("CENTRE.x", "CENTRE.y"), crs=4326)
+
+df.map = df.loc + 
+  tm_shape(mean) + tm_dots(col = "red", size = 0.1) + 
+  tm_shape(sde) + tm_lines(col = "blue", lwd = 2) +
+  tm_shape(sdd) + tm_lines(col = "purple", lwd =2, lty = 2) +
+  tm_layout(main.title = "Centre and Orientation of School Locations") +
+  tm_add_legend(type = "symbol", col = "red", shape = 20, labels = "Mean Centre") +
+  tm_add_legend(type = "line", col = "blue", lty = 2, labels = "Standard Deviational Ellipse") +
+  tm_add_legend(type = "line", col = "purple", lty = 1, labels = "Standard Distance") +
+  tm_compass(type = "4star",position=c("left","top")) + 
+  tm_scale_bar(position = c("right","top"))+
+  tmap_mode('plot')
+df.map
+```
+
+The central point of the spatial distribution of schools is close to the centre of Singapore. Using the standard distance, we see that observation points are not too compact around their spatial mean, as the circle stretches 1/3 of Singapore's area. The shape of the standard deviational ellipse differs from the shape of the standard distance, indicating that the distribution of features is elongated and has a particular orientation along the West-East axis (x axis) of Singapore. We believe this mimics the elongated shape of Singapore along the x axis.
+
+# Real World Events Analysis
+In recent news, it was announced that Anglo-Chinese School (Primary) will be moving to Tengah. In the MOE press release, it was mentioned that the new location in Tengah was over 12km from ACS(P) at Barker. 
+
+Priority admissions to primary schools are also given to Singaporean Citizens living in a 1km radius of a primary school. As the new ACS(P) location in Tengah is surrounded by soon-to-be-built Build-To-Order (BTO) flats, this is a significant consideration for many parents. 
+
+We hope to verify the above facts through our geospatial maps.
+
+* P1 Registration Priority: https://www.moe.gov.sg/primary/p1-registration/distance
+* MOE Press release: https://www.moe.gov.sg/news/press-releases/20230209-new-schools-to-meet-demand-in-the-west-and-north-east-of-singapore
+
+We first map the new Tengah location and surrounding MRTs.
+```{r}
+tengah <- st_point(c(103.738065, 1.364462))
+tengah_point <- st_sfc(tengah)
+attr <- data.frame(Name="Proposed location of Anglo Chinese School (Primary)")
+tengah_sf <- st_sf(attr, geom=tengah_point, crs=4326)
+st_crs(tengah_sf)$proj
+class(tengah_sf)
+tengah.proj <- st_transform(tengah_sf, crs = st_crs(sg))
+
+bb_mrt <- st_point(c(103.74975547823435, 1.3500769401611374))
+bb_mrt <- st_sfc(bb_mrt)
+attr_bb <-  data.frame(Name="Bukit Batok MRT Station")
+bb_mrt <- st_sf(attr_bb, geom=bb_mrt,crs=4326)
+bb_mrt.proj <- st_transform(bb_mrt, crs=st_crs(sg))
+
+cg_mrt <- st_sfc(st_point(c(103.73212158638334, 1.3434972867344381)))
+attr_cg <-  data.frame(Name="Chinese Gardens MRT Station")
+cg_mrt <- st_sf(attr_cg,geom=cg_mrt,crs=4326)
+cg_mrt.proj <- st_transform(cg_mrt, crs=st_crs(sg))
+
+lk_mrt <- st_sfc(st_point(c(103.72062027467906,1.3440979365098575)))
+attr_lk <-  data.frame(Name="Lakeside Gardens MRT Station")
+lk_mrt <- st_sf(attr_lk,geom=lk_mrt,crs=4326)
+lk_mrt.proj <- st_transform(lk_mrt, crs=st_crs(sg))
+
+bl_mrt <- st_sfc(st_point(c(103.70622754053471,1.3400167340203737)))
+attr_bl <-  data.frame(Name="Boon Lay MRT Station")
+bl_mrt <- st_sf(attr_bl, geom=bl_mrt,crs=4326)
+bl_mrt.proj <- st_transform(bl_mrt, crs=st_crs(sg))
+
+```
+
+We wanted to visualise the new location of ACS(P) at Tengah in the context of all schools in Singapore. It is represented by the blue marker icon.
+```{r}
+
+tm_shape(sg)+tm_borders()+tm_shape(df.proj)+
+  tm_dots()+tmap_options(max.categories=346)+
+  tm_shape(tengah.proj)+tm_markers(shape = marker_icon(), size=0.3, text.just="top")+
+  tm_layout(main.title = "Plot of ASC(P) in Tengah Location")+
+  tm_add_legend(type="symbol",shape=19,col='lightblue', labels='Marker point indicates new ACS(P) location')+
+  tm_compass(type = "4star",position=c("left","top")) + 
+  tm_scale_bar(position = c("right","top"))+
+  tmap_mode('plot')
+```
+
+We did the same analysis as above, but for each nature of school. This was for co-ed schools and the new Tengah location. The new ACS(P) is looking to turn co-ed, from a boys school. The purpose of this analysis is to visualise how ACS(P) turning co-ed would add to the distribution of co-ed schools in Singapore.
+```{r}
+coed <- df.proj %>%
+  filter(nature_cod == 'CO-ED SCHOOL')
+boys <- df.proj %>%
+  filter(nature_cod == "BOYS' SCHOOL")
+girls <- df.proj %>%
+  filter(nature_cod == "GIRLS' SCHOOL")
+
+
+tm_shape(sg)+tm_borders()+tm_shape(coed)+
+  tm_dots(col='orange')+
+  tm_shape(tengah.proj)+tm_markers(shape = marker_icon(), size=0.1, text.just="top")+
+  tm_layout(main.title = "Co-ed School Distribution after ACS(P) turns co-ed")+
+    tm_compass(type = "4star",position=c("left","top")) + 
+  tm_add_legend(type="symbol",shape=19,col='lightblue', labels='Marker point indicates new ACS(P) location')+
+  tm_scale_bar(position = c("right","top"))+
+  tmap_mode('plot')
+```
+
+The new ACS(P), in the context of all boys schools is below. As concluded above, boys schools are typically located on the Eastern part of Singapore. This movement of ACS(P) will reduce the density of boys schools at the Eastern part of Singapore.
+
+The movement would not affect the density of girls schools in Singapore, hence it was not plotted.
+```{r}
+## location of new ACS primary school amongst all boys schools
+tm_shape(sg)+tm_borders()+tm_shape(boys)+
+  tm_dots(col='blue')+
+  tm_shape(tengah.proj)+tm_markers(shape = marker_icon(), size=0.1, text.just="top")+
+  tm_layout(main.title = "Location of new ACS(P) amongst all boys schools")+
+  tmap_mode('view')
+```
+
+We also wanted to study the distance between the old location of ACS(P) and its proposed new location. 
+```{r}
+## new ACS school and old ACS schools
+old_ACS <- df.proj %>%
+  filter(grepl('ANGLO',school_nam))
+
+relocate_ACS <- df.proj %>%
+  filter(school_nam=='ANGLO-CHINESE SCHOOL (PRIMARY)')
+
+### distance between two ACS
+dist <- st_distance(tengah.proj['geom'],
+                    relocate_ACS['geometry'])
+dist
+```
+The distance between ACS(P) at Barker Road and the Tengah location is approximately 12km, which verifies this detail in MOE's press release.
+
+We wanted to plot this distance on the map, and contextualise the analysis to the locations of other Anglo-Chinese schools in Singapore. E.g. Anglo-Chinese Junior College, Anglo Chinese School (Independent), etc.
+```{r,message=FALSE}
+xy_t <- st_coordinates(tengah.proj)
+xy_a <- st_coordinates(relocate_ACS)
+dist_mat <- rbind(c(xy_a[,1],xy_a[,2]), c(xy_t[,1], xy_t[,2]))
+dist_line <- st_sfc(st_linestring(dist_mat))
+
+attr_dist <-  data.frame(Name="Euclidean Distance between old and new ACS",
+                         Distance=dist)
+dist_df <- st_sf(attr_dist, geom=dist_line,crs=st_crs(sg))
+
+tm_shape(sg)+tm_borders()+
+  tm_shape(relocate_ACS)+tm_dots(shape=4,size=0.5,col="red")+
+  tm_shape(old_ACS)+tm_dots(col='goldenrod3',size=0.2)+
+  tm_shape(tengah.proj)+tm_markers(shape = marker_icon(), size=0.2)+
+  tm_shape(dist_df)+
+  tm_lines()+
+  tm_add_legend(type="symbol",
+                labels = "Anglo-Chinese (PRIMARY) School - To be relocated",
+                shape=4,col='red')+
+  tm_add_legend(type="line",
+                labels = "Euclidean Distance of old and new location of Anglo-Chinese (PRIMARY) = 11949.54m",
+                lty = 1)+
+  tm_add_legend(type='symbol',
+                labels='other Anglo-Chinese schools',
+                shape=19,
+                col='goldenrod3')+
+    tm_add_legend(type="symbol",shape=19,col='lightblue', labels='Marker point indicates new ACS(P) location')+
+  tm_layout(legend.outside=TRUE,legend.outside.position='bottom',
+            legend.stack='vertical', main.title = "Location of Anglo-Chinese schools")+
+    tm_compass(type = "4star",position=c("left","top")) + 
+  tm_scale_bar(position = c("right","top"))+
+  tmap_mode('plot')
+
+```
+
+Next, we moved on to analyse the 1km radius around the new ACS(P) location, to verify the P1 registration priority criteria.
+```{r}
+## 1km radius around ACS
+buff <-st_buffer(tengah.proj, dist=1000)
+
+tengah_pln_area <- sg %>%
+  filter(PLN_AREA_N == 'TENGAH' | PLN_AREA_N == 'BUKIT BATOK'|
+           PLN_AREA_N == 'JURONG WEST' | PLN_AREA_N == 'JURONG EAST'|
+           PLN_AREA_N == 'CLEMENTI')
+tengah_pln_area
+
+bb_sch <- df.proj %>%
+  filter((dgp_code == 'BUKIT BATOK'|
+           dgp_code == 'JURONG WEST'|
+           dgp_code == 'JURONG EAST') & mainlevel_ == 'PRIMARY')
+
+mrt <- tmap_icons("/Users/celyntay/downloads/dsa303/data/chihao.sgmrtmap.png")
+
+tm_shape(tengah_pln_area)+tm_borders()+tm_text(text = 'PLN_AREA_N')+
+  tm_shape(buff)+tm_polygons(alpha=0.3,lty="dotted")+
+  tm_shape(tengah.proj)+tm_markers(shape = marker_icon(), size=0.5)+
+  tm_shape(bb_sch)+tm_dots(col="blue",size=0.1)+
+  tm_shape(bb_mrt.proj)+tm_symbols(shape=mrt, size=0.1,border.lwd=NA)+
+  tm_shape(cg_mrt.proj)+tm_symbols(shape=mrt, size=0.1,border.lwd=NA)+
+  tm_shape(lk_mrt.proj)+tm_symbols(shape=mrt, size=0.1,border.lwd=NA)+
+  tm_shape(bl_mrt.proj)+tm_symbols(shape=mrt, size=0.1,border.lwd=NA)+
+  tm_add_legend(type="line", labels="1km radius around new ACS (Primary) school", lty='dotted')+
+  tm_add_legend(type="symbol",shape = 19,col="blue",labels="Schools in neighbouring planning areas")+
+  tm_add_legend(type = "symbol", col = "red",shape = 19, labels = "MRT Stations near new ACS (Primary) School")+
+  tm_layout(legend.outside = TRUE,legend.outside.position = 'bottom', main.title = "New ACS(P) at Tengah location - Surrounding schools and MRT Stations", main.title.size = 0.6, main.title.position = "center")+
+    tm_compass(type = "4star",position=c("left","top")) + 
+  tm_scale_bar(position = c("right","top"))+
+  tmap_mode('plot')
+
+map2 <- tm_shape(tengah_pln_area)+tm_borders()+tm_text(text = 'PLN_AREA_N')+
+  tm_shape(buff)+tm_polygons(alpha=0.3,lty="dotted")+
+  tm_shape(tengah.proj)+tm_markers(shape = marker_icon(), size=0.5)+
+  tm_shape(df.proj)+tm_dots(col='black')+
+  tm_shape(bb_mrt.proj)+tm_symbols(shape=mrt, size=0.1,border.lwd=NA)+
+  tm_shape(cg_mrt.proj)+tm_symbols(shape=mrt, size=0.1,border.lwd=NA)+
+  tm_shape(lk_mrt.proj)+tm_symbols(shape=mrt, size=0.1,border.lwd=NA)+
+  tm_shape(bl_mrt.proj)+tm_symbols(shape=mrt, size=0.1,border.lwd=NA)+
+  tmap_mode('view')
+map2
+```
+
+If you zoom into the map below, you will see that the current new school at Tengah has not been built, and the Build to Order flats around it are still under construction.
+
+```{r}
+map2 + tm_basemap(server="Esri.WorldImagery")
+```
+
+This map view below might be helpful to check out the amenities around the new school. Mostly housing!
+
+```{r}
+map2 + tm_basemap(server="OpenStreetMap")
+```
+
+The above analysis tell us that Singaporean Citizens living in flats in the Tengah, and to a small extent in the Bukit Batok region, would have priority to register their children for the new ACS(P). Even if they were unsuccessful, there would be a host of other nearby schools, especially those in Bukit Batok, that would be available to them.
+
+St. Anthony's Primary School and DaZhong Primary School are options for residents living in the 1km radius of the new ACS(P) at Tengah location, that had hoped to get into the new ACS(P) that didn't. By plotting the overlaps of the 1km radius from these 3 schools, we can see that the residents living in the overlaps of the 1km radii of these 3 schools have several options to pick from for primary schools. Hence, there is no need for parents of young children living in Tengah to fret over P1 registration.
+```{r}
+saps <- df.proj %>%
+  filter(school_nam == "ST. ANTHONY'S PRIMARY SCHOOL")
+saps_buff <- st_buffer(saps, dist=1000)
+dzps <- df.proj %>%
+  filter(school_nam == "DAZHONG PRIMARY SCHOOL")
+dzps_buff <- st_buffer(dzps, dist=1000)
+
+map1 <- tm_shape(tengah_pln_area)+tm_borders()+tm_text(text = 'PLN_AREA_N')+
+  tm_shape(tengah.proj)+tm_markers(shape = marker_icon(), size=0.5)+
+  tm_shape(buff)+tm_polygons(alpha=0.3,lty="dotted")+
+  tm_shape(saps_buff)+tm_polygons(alpha=0.3,lty="dotted",col="yellow")+
+  tm_shape(dzps_buff)+tm_polygons(alpha=0.3,lty="dotted",col="pink")+
+  tm_shape(bb_sch)+tm_dots(col="blue",size=0.1)+
+  tm_shape(bb_mrt.proj)+tm_symbols(shape=mrt, size=0.1,border.lwd=NA)+
+  tm_shape(cg_mrt.proj)+tm_symbols(shape=mrt, size=0.1,border.lwd=NA)+
+  tm_shape(lk_mrt.proj)+tm_symbols(shape=mrt, size=0.1,border.lwd=NA)+
+  tm_shape(bl_mrt.proj)+tm_symbols(shape=mrt, size=0.1,border.lwd=NA)+
+  tm_add_legend(type="line", labels="1km radius around new ACS (Primary) school", lty='dotted')+
+  tm_add_legend(type="symbol",shape = 19,col="blue",labels="Schools in neighbouring planning areas")+
+  tm_add_legend(type = "symbol", col = "red",shape = 19, labels = "MRT Stations near new ACS (Primary) School")+
+  tm_layout(legend.outside = TRUE,legend.outside.position = 'bottom', main.title = "Other schools near the new ACS(P)", main.title.size = 1)+
+  tmap_mode('plot')
+
+map1
+```
+
+This concludes the end of our analysis on schools in Singapore, we hope you've enjoyed it :)
+
+Reference List:
+Varet, S., Lacour, C., Massart, P., & Rivoirard, V. (2019). Numerical performance of Penalized Comparison to Overfitting for multivariate kernel density estimation. Esaim: Probability and Statistics. https://doi.org/10.1051/ps/2022018
